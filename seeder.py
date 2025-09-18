@@ -17,6 +17,7 @@ ICE_SERVERS = [
     RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
 ]
 
+
 async def run(signal_url: str, file_id: str, path: str, hash_meta: bool=False):
     meta = file_meta(path, with_hash=hash_meta)
     logging.info("[seeder] file meta: %s", meta)
@@ -33,7 +34,7 @@ async def run(signal_url: str, file_id: str, path: str, hash_meta: bool=False):
             t = msg.get("type")
 
             if t == "peer-ready":
-            # 等客户端 offer
+                # 等客户端 offer
                 logging.info("[seeder] peer ready: %s", msg)
 
             elif t == "offer":
@@ -49,9 +50,9 @@ async def run(signal_url: str, file_id: str, path: str, hash_meta: bool=False):
 
                     @dc.on("message")
                     def on_message(data):
-                    # data 可能为 bytes 或 str
+                        # data 可能为 bytes 或 str
                         if isinstance(data, bytes):
-                        # 客户端不会发二进制命令
+                            # 客户端不会发二进制命令
                             return
                         try:
                             obj = json.loads(data)
@@ -64,6 +65,7 @@ async def run(signal_url: str, file_id: str, path: str, hash_meta: bool=False):
                             index = int(obj.get("index", 0))
                             payload = read_chunk(path, index)
                             dc.send(payload)
+
                 @pc.on("icecandidate")
                 async def on_icecandidate(event):
                     cand = event.candidate
@@ -72,24 +74,25 @@ async def run(signal_url: str, file_id: str, path: str, hash_meta: bool=False):
                             "type": "candidate",
                             "file_id": file_id,
                             "candidate": cand.to_sdp(),
-                            }))
+                        }))
+
                 offer = RTCSessionDescription(sdp=msg["sdp"]["sdp"], type=msg["sdp"]["type"])
                 await pc.setRemoteDescription(offer)
                 answer = await pc.createAnswer()
                 await pc.setLocalDescription(answer)
                 await ws.send(json.dumps({
-                "type": "answer",
-                "file_id": file_id,
-                "sdp": {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp},
+                    "type": "answer",
+                    "file_id": file_id,
+                    "sdp": {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp},
                 }))
                 logging.info("[seeder] sent answer, waiting for requests ...")
+
             elif t == "candidate":
                 if pc and msg.get("candidate"):
                     # aiortc 的 from_sdp 用法：pc.addIceCandidate(candidate)
                     cand_sdp = msg["candidate"]
                     # aiortc 允许直接传字符串 SDP（兼容）
                     await pc.addIceCandidate(cand_sdp)
-
 
     logging.info("[seeder] signaling closed")
 

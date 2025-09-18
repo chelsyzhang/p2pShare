@@ -6,7 +6,7 @@ import math
 import hashlib
 
 
-CHUNK_SIZE = 64 * 1024 # 64KB，可按需调整（越大越快但丢包重传代价也大）
+CHUNK_SIZE = 512 * 1024 # 64KB，可按需调整（越大越快但丢包重传代价也大）
 
 def file_meta(path: str, with_hash=False):
     size = os.path.getsize(path)
@@ -30,6 +30,6 @@ def file_meta(path: str, with_hash=False):
 
 
 def read_chunk(path: str, index: int) -> bytes:
-with open(path, "rb") as f:
-f.seek(index * CHUNK_SIZE)
-return f.read(CHUNK_SIZE)
+    with open(path, "rb") as f:
+        f.seek(index * CHUNK_SIZE)
+    return f.read(CHUNK_SIZE)
