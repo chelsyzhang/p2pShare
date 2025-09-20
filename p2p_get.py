@@ -7,7 +7,7 @@ import logging
 import websockets
 from aiortc import RTCIceServer, RTCConfiguration, RTCPeerConnection
 from aiortc import RTCSessionDescription
-from aiortc.data_channel import RTCDataChannel
+from aiortc import RTCDataChannel
 
 logging.basicConfig(level=logging.INFO)
 
