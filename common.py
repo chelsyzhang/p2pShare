@@ -1,12 +1,11 @@
-# common.py - 公共工具：消息、分片等
-
+# common.py - 公共工具：分片、元数据、一些小配置
 
 import os
 import math
 import hashlib
 
+CHUNK_SIZE = 128 * 1024  # 调大一些，提升吞吐
 
-CHUNK_SIZE = 512 * 1024 # 64KB，可按需调整（越大越快但丢包重传代价也大）
 
 def file_meta(path: str, with_hash=False):
     size = os.path.getsize(path)
@@ -27,9 +26,7 @@ def file_meta(path: str, with_hash=False):
     return meta
 
 
-
-
 def read_chunk(path: str, index: int) -> bytes:
     with open(path, "rb") as f:
         f.seek(index * CHUNK_SIZE)
-    return f.read(CHUNK_SIZE)
+        return f.read(CHUNK_SIZE)

@@ -1,5 +1,5 @@
-# server.py - 极简 WebSocket 信令服务器
-# 用途：按 file_id 把 seeder 与 client 配对，转发 offer/answer/ice-candidate
+# server.py - WebSocket 信令服务器（支持双向发起 offer / answer / candidate 转发）
+# 功能：按 file_id 把两端配对，并且不假设由哪一端先发起 offer。
 
 import asyncio
 import json
@@ -10,89 +10,98 @@ from typing import Dict, Optional
 
 logging.basicConfig(level=logging.INFO)
 
-# 每个 room(file_id) 保持两个角色的连接
 class Room:
     def __init__(self):
-        self.seeder: Optional[websockets.WebSocketServerProtocol] = None
-        self.client: Optional[websockets.WebSocketServerProtocol] = None
+        self.a: Optional[websockets.WebSocketServerProtocol] = None
+        self.b: Optional[websockets.WebSocketServerProtocol] = None
+
+    def add(self, role: str, ws: websockets.WebSocketServerProtocol):
+        # 兼容旧的 role 名称："seeder"/"client" 或任意字符串
+        if self.a is None:
+            self.a = ws
+            return "a"
+        elif self.b is None and ws is not self.a:
+            self.b = ws
+            return "b"
+        # 已满或重复
+        return None
+
+    def counterpart(self, ws):
+        if ws is self.a:
+            return self.b
+        if ws is self.b:
+            return self.a
+        return None
 
 rooms: Dict[str, Room] = {}
 
 async def handler(ws, path):
     file_id = None
-    role = None
     try:
-        async for msg in ws:
-            data = json.loads(msg)
-            t = data.get("type")
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
 
+            t = msg.get("type")
             if t == "register":
-                role = data.get("role")
-                file_id = data.get("file_id")
-                if not file_id or role not in ("seeder", "client"):
-                    await ws.send(json.dumps({"type": "error", "reason": "bad register"}))
+                file_id = msg.get("file_id")
+                role = msg.get("role", "peer")
+                if not file_id:
+                    await ws.send(json.dumps({"type": "error", "reason": "missing file_id"}))
                     continue
                 room = rooms.setdefault(file_id, Room())
-                if role == "seeder":
-                    room.seeder = ws
-                else:
-                    room.client = ws
-                logging.info("%s joined file_id=%s", role, file_id)
-                await ws.send(json.dumps({"type": "registered", "file_id": file_id, "role": role}))
+                slot = room.add(role, ws)
+                if not slot:
+                    await ws.send(json.dumps({"type": "error", "reason": "room full or duplicate"}))
+                    continue
+                logging.info("peer joined file_id=%s as %s (role=%s)", file_id, slot, role)
+                await ws.send(json.dumps({"type": "registered", "file_id": file_id, "slot": slot}))
+                # 两端就绪后互相通知
+                if room.a and room.b:
+                    for peer in (room.a, room.b):
+                        try:
+                            await peer.send(json.dumps({"type": "peer-ready", "file_id": file_id}))
+                        except Exception:
+                            logging.exception("notify peer-ready failed")
+                continue
 
-                # 如果两端都在，通知彼此就绪
-                if room.seeder and room.client:
-                    try:
-                        await room.client.send(json.dumps({"type": "peer-ready", "file_id": file_id}))
-                        await room.seeder.send(json.dumps({"type": "peer-ready", "file_id": file_id}))
-                    except Exception:
-                        logging.exception("notify peer-ready failed")
-
-            elif t in ("offer", "answer", "candidate"):
-                file_id = data.get("file_id")
+            # 以下所有信令都无方向假设：直接转发给对端
+            if t in ("offer", "answer", "candidate", "bye"):
+                if not file_id:
+                    file_id = msg.get("file_id")
                 room = rooms.get(file_id)
                 if not room:
                     await ws.send(json.dumps({"type": "error", "reason": "unknown file_id"}))
                     continue
-                dst = None
-                if t == "offer":
-                    # client -> seeder
-                    dst = room.seeder
-                elif t == "answer":
-                    # seeder -> client
-                    dst = room.client
-                elif t == "candidate":
-                    # 双向候选转发
-                    # 判断发送者是谁，转发给对端
-                    if ws is room.seeder:
-                        dst = room.client
-                    else:
-                        dst = room.seeder
-                if dst:
-                    try:
-                        await dst.send(json.dumps(data))
-                    except Exception:
-                        logging.exception("forward failed: %s", t)
+                dst = room.counterpart(ws)
+                if not dst:
+                    await ws.send(json.dumps({"type": "error", "reason": "peer not ready"}))
+                    continue
+                try:
+                    await dst.send(json.dumps(msg))
+                except Exception:
+                    logging.exception("forward %s failed", t)
+                continue
 
     except websockets.ConnectionClosed:
         pass
     finally:
-        # 清理
-        if file_id and role:
+        if file_id:
             room = rooms.get(file_id)
             if room:
-                if role == "seeder" and room.seeder is ws:
-                    room.seeder = None
-                if role == "client" and room.client is ws:
-                    room.client = None
-                if not room.seeder and not room.client:
+                if room.a is ws:
+                    room.a = None
+                if room.b is ws:
+                    room.b = None
+                if not room.a and not room.b:
                     rooms.pop(file_id, None)
-        logging.info("connection closed: role=%s file_id=%s", role, file_id)
-
+        logging.info("connection closed for file_id=%s", file_id)
 
 async def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
 
