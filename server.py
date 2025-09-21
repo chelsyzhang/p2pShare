@@ -1,12 +1,16 @@
-# signal_server.py
 import asyncio
 import json
 import websockets
 from collections import defaultdict, deque
 
-# 房间 -> {"sender": ws or None, "receiver": ws or None, "queue": deque[(role, msg_json_str)]}
-rooms = defaultdict(lambda: {"sender": None, "receiver": None, "queue": deque()})
+# 房间结构：存 sender/receiver websocket，以及消息缓存队列
+rooms = defaultdict(lambda: {
+    "sender": None,
+    "receiver": None,
+    "queue": deque(maxlen=100)  # 缓存最近 100 条消息（SDP/ICE）
+})
 LOCK = asyncio.Lock()
+
 
 async def handler(ws):
     room_name = None
@@ -20,16 +24,18 @@ async def handler(ws):
                 continue
 
             t = msg.get("type")
+
             if t == "join":
                 # {type:"join", room:"abc", role:"sender"/"receiver"}
                 room_name = msg.get("room")
                 role = msg.get("role")
                 if not room_name or role not in ("sender", "receiver"):
-                    await ws.send(json.dumps({"type":"error","error":"bad_join"}))
+                    await ws.send(json.dumps({"type": "error", "error": "bad_join"}))
                     continue
+
                 async with LOCK:
                     r = rooms[room_name]
-                    # 挤掉旧连接
+                    # 如果已有同角色，挤掉旧的
                     old = r.get(role)
                     if old and old.open:
                         try:
@@ -37,34 +43,40 @@ async def handler(ws):
                         except:
                             pass
                     r[role] = ws
-                    # 把历史消息（对端离线期间）回放给新加入的一方
-                    # 仅回放对方发来的（避免自回放）
-                    buf = []
-                    for who, m in r["queue"]:
+                    # 回确认
+                    await ws.send(json.dumps({
+                        "type": "joined",
+                        "room": room_name,
+                        "role": role
+                    }))
+                    # 回放缓存消息（只给新加入的另一方发过的消息）
+                    for who, m in list(r["queue"]):
                         if who != role:
-                            buf.append(m)
-                    for m in buf:
-                        await ws.send(m)
-                await ws.send(json.dumps({"type":"joined","room":room_name,"role":role}))
+                            await ws.send(m)
+
             elif t in ("sdp", "ice"):
-                # {type:"sdp", "data":{...}} 或 {type:"ice", "data":{...}}
                 if not room_name or not role:
-                    await ws.send(json.dumps({"type":"error","error":"join_first"}))
+                    await ws.send(json.dumps({"type": "error", "error": "join_first"}))
                     continue
+
                 other = "receiver" if role == "sender" else "sender"
                 msg_str = json.dumps(msg)
+
                 async with LOCK:
                     r = rooms[room_name]
                     peer = r.get(other)
                     if peer and peer.open:
                         await peer.send(msg_str)
                     else:
-                        # 对方不在线，缓存
+                        # 对方还没来，先缓存
                         r["queue"].append((role, msg_str))
+
             elif t == "leave":
                 break
+
             else:
-                await ws.send(json.dumps({"type":"error","error":"unknown_type"}))
+                await ws.send(json.dumps({"type": "error", "error": "unknown_type"}))
+
     except websockets.ConnectionClosed:
         pass
     finally:
@@ -73,9 +85,9 @@ async def handler(ws):
                 r = rooms.get(room_name)
                 if r and r.get(role) is ws:
                     r[role] = None
-                # 房间无人时清理缓存
                 if r and not r["sender"] and not r["receiver"]:
                     del rooms[room_name]
+
 
 async def main():
     import argparse
@@ -87,6 +99,7 @@ async def main():
     async with websockets.serve(handler, args.host, args.port, max_size=2**22):
         print(f"Signal server listening on ws://{args.host}:{args.port}")
         await asyncio.Future()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
