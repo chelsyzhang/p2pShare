@@ -1,3 +1,7 @@
-python p2p_get.py --signal ws://114.132.234.219:2024 \
---file-id test123 \
--o ../data/dataimages_0917.tar 
+python p2p_get.py \
+  --signaling ws://114.132.234.219:2024 \
+  --room myroom123 \
+  --stun stun:stun.l.google.com:19302 \
+  --turn turn:114.132.234.219:2025?transport=udp \
+  --turn-user fileshareuser \
+  --turn-pass filesharepass

@@ -1,107 +1,147 @@
-# seeder.py - 本地分享端：连接信令，等待客户端，走 WebRTC DataChannel 按需发送分片
-
+# share.py
 import argparse
 import asyncio
+import hashlib
 import json
-import logging
+import os
+import sys
 import websockets
-from aiortc import RTCIceServer, RTCConfiguration, RTCPeerConnection
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer
+from aiortc import RTCConfiguration
 from aiortc.contrib.signaling import BYE
-from aiortc import RTCSessionDescription
-from aiortc import RTCDataChannel
-from common import file_meta, read_chunk
 
-logging.basicConfig(level=logging.INFO)
+CHUNK_SIZE = 64 * 1024  # 64KB，实践中 32~256KB 自行调优
 
-ICE_SERVERS = [
-    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-]
+def human(n):
+    for unit in ["B","KB","MB","GB","TB"]:
+        if n < 1024:
+            return f"{n:.2f}{unit}"
+        n/=1024
+    return f"{n:.2f}PB"
 
+async def run(args):
+    # ICE 服务器：先尝试直连（host/srflx），失败走 relay
+    ice_servers = []
+    if args.stun:
+        ice_servers.append(RTCIceServer(urls=[args.stun]))
+    if args.turn and args.turn_user and args.turn_pass:
+        ice_servers.append(RTCIceServer(urls=[args.turn],
+                                        username=args.turn_user,
+                                        credential=args.turn_pass))
 
-async def run(signal_url: str, file_id: str, path: str, hash_meta: bool=False):
-    meta = file_meta(path, with_hash=hash_meta)
-    logging.info("[seeder] file meta: %s", meta)
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+    # 建数据通道（可靠、有序）
+    channel = pc.createDataChannel("file", ordered=True)
 
-    async with websockets.connect(signal_url, max_size=2**25) as ws:
-        await ws.send(json.dumps({"type": "register", "role": "seeder", "file_id": file_id}))
-        logging.info("[seeder] registered, waiting client ...")
+    done_fut = asyncio.get_event_loop().create_future()
+    file_size = os.path.getsize(args.file)
+    file_name = os.path.basename(args.file)
 
-        pc = None
-        channel = None
+    # 先发送元信息
+    async def send_file():
+        sha256 = hashlib.sha256()
+        sent = 0
+        start_ts = asyncio.get_event_loop().time()
+        with open(args.file, "rb") as f:
+            meta = {"kind":"meta","name":file_name,"size":file_size}
+            channel.send(json.dumps(meta))
+            await asyncio.sleep(0)  # 让 meta 先发出去
 
-        async for raw in ws:
-            msg = json.loads(raw)
-            t = msg.get("type")
+            while True:
+                # 回压控制
+                while channel.bufferedAmount > 8 * CHUNK_SIZE:
+                    await asyncio.sleep(0.01)
 
-            if t == "peer-ready":
-                # 等客户端 offer
-                logging.info("[seeder] peer ready: %s", msg)
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                sha256.update(chunk)
+                channel.send(chunk)
+                sent += len(chunk)
 
-            elif t == "offer":
-                # 创建 peer，设置 remote desc，创建 answer
-                logging.info("[seeder] got offer")
-                pc = RTCPeerConnection(configuration=RTCConfiguration(ICE_SERVERS))
+                # 简单进度
+                if args.quiet is False:
+                    pct = sent / file_size * 100 if file_size > 0 else 100
+                    sys.stdout.write(f"\rSending {file_name}: {human(sent)}/{human(file_size)} ({pct:.1f}%)")
+                    sys.stdout.flush()
 
-                @pc.on("datachannel")
-                def on_datachannel(dc: RTCDataChannel):
-                    nonlocal channel
-                    channel = dc
-                    logging.info("[seeder] datachannel: %s", dc.label)
+            # 结束标记 + 校验
+            digest = sha256.hexdigest()
+            channel.send(json.dumps({"kind":"eof","sha256": digest}))
+            if args.quiet is False:
+                dt = asyncio.get_event_loop().time() - start_ts
+                rate = sent / max(dt,1e-6)
+                sys.stdout.write(f"\nDone in {dt:.2f}s, avg {human(rate)}/s, sha256={digest}\n")
+                sys.stdout.flush()
 
-                    @dc.on("message")
-                    def on_message(data):
-                        # data 可能为 bytes 或 str
-                        if isinstance(data, bytes):
-                            # 客户端不会发二进制命令
-                            return
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
-                            return
-                        cmd = obj.get("type")
-                        if cmd == "GET_META":
-                            dc.send(json.dumps({"type": "META", **meta}))
-                        elif cmd == "GET_CHUNK":
-                            index = int(obj.get("index", 0))
-                            payload = read_chunk(path, index)
-                            dc.send(payload)
+    @channel.on("open")
+    def on_open():
+        asyncio.ensure_future(send_file())
 
-                @pc.on("icecandidate")
-                async def on_icecandidate(event):
-                    cand = event.candidate
-                    if cand:
-                        await ws.send(json.dumps({
-                            "type": "candidate",
-                            "file_id": file_id,
-                            "candidate": cand.to_sdp(),
-                        }))
+    @channel.on("message")
+    def on_message(msg):
+        try:
+            j = json.loads(msg) if isinstance(msg, (str, bytes)) and isinstance(msg, bytes) and msg[:1]==b'{' else json.loads(msg) if isinstance(msg, str) else None
+        except Exception:
+            j = None
+        if isinstance(j, dict) and j.get("kind") == "ack":
+            if not done_fut.done():
+                done_fut.set_result(True)
 
-                offer = RTCSessionDescription(sdp=msg["sdp"]["sdp"], type=msg["sdp"]["type"])
-                await pc.setRemoteDescription(offer)
-                answer = await pc.createAnswer()
-                await pc.setLocalDescription(answer)
-                await ws.send(json.dumps({
-                    "type": "answer",
-                    "file_id": file_id,
-                    "sdp": {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp},
-                }))
-                logging.info("[seeder] sent answer, waiting for requests ...")
+    @pc.on("iceconnectionstatechange")
+    def on_ice():
+        print("ICE state:", pc.iceConnectionState)
+        if pc.iceConnectionState in ("failed","disconnected","closed"):
+            if not done_fut.done():
+                done_fut.set_exception(RuntimeError(f"ICE {pc.iceConnectionState}"))
 
-            elif t == "candidate":
-                if pc and msg.get("candidate"):
-                    # aiortc 的 from_sdp 用法：pc.addIceCandidate(candidate)
-                    cand_sdp = msg["candidate"]
-                    # aiortc 允许直接传字符串 SDP（兼容）
-                    await pc.addIceCandidate(cand_sdp)
+    # === 信令流程 ===
+    async with websockets.connect(args.signaling) as ws:
+        await ws.send(json.dumps({"type":"join","room":args.room,"role":"sender"}))
+        joined = json.loads(await ws.recv())
+        assert joined.get("type")=="joined"
 
-    logging.info("[seeder] signaling closed")
+        # 本地创建 offer
+        offer = await pc.createOffer()
+        await pc.setLocalDescription(offer)
+        await ws.send(json.dumps({"type":"sdp","data":{"sdp":pc.localDescription.sdp,"type":pc.localDescription.type}}))
 
+        async def recv_task():
+            async for raw in ws:
+                m = json.loads(raw)
+                if m["type"]=="sdp":
+                    sdp = m["data"]
+                    await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp["sdp"], type=sdp["type"]))
+                elif m["type"]=="ice":
+                    cand = m["data"]
+                    await pc.addIceCandidate(cand)
+        rt = asyncio.create_task(recv_task())
+
+        # 把本地 ICE 候选发给对端
+        @pc.on("icecandidate")
+        async def on_candidate(c):
+            if c:
+                await ws.send(json.dumps({"type":"ice","data":{
+                    "candidate": c.to_sdp(),
+                    "sdpMid": c.sdpMid,
+                    "sdpMLineIndex": c.sdpMLineIndex
+                }}))
+
+        # 等待发送完成或失败
+        await done_fut
+        await ws.send(BYE)
+        rt.cancel()
+    await pc.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--signal", required=True, help="ws://host:port")
-    parser.add_argument("--file", required=True)
-    parser.add_argument("--file-id", required=True)
-    parser.add_argument("--hash", action="store_true", help="include sha256 in META")
+    parser.add_argument("--signaling", required=True, help="ws://your-vps-ip:8765")
+    parser.add_argument("--room", required=True, help="room id (any string)")
+    parser.add_argument("--file", required=True, help="path of file to send")
+    parser.add_argument("--stun", default="stun:stun.l.google.com:19302", help="STUN url")
+    parser.add_argument("--turn", help="TURN url, e.g. turn:your-vps:3478?transport=udp")
+    parser.add_argument("--turn-user", help="TURN username")
+    parser.add_argument("--turn-pass", help="TURN password")
+    parser.add_argument("--quiet", action="store_true", default=False)
     args = parser.parse_args()
-    asyncio.run(run(args.signal, args.file_id, args.file, args.hash))
+    asyncio.run(run(args))

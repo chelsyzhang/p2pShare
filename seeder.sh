@@ -1,3 +1,8 @@
-python seeder.py --signal ws://114.132.234.219:2024 \
---file /home/qi/code/spider/Qsearch/data/images_0917.tar \
---file-id test123
+python seeder.py \
+  --signaling ws://14.132.234.219:2024 \
+  --room myroom123 \
+  --file /home/qi/code/data/dataimages_0917.tar \
+  --stun stun:stun.l.google.com:19302 \
+  --turn turn:114.132.234.219:2025?transport=udp \
+  --turn-user fileshareuser \
+  --turn-pass filesharepass

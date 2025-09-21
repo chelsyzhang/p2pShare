@@ -1,166 +1,148 @@
-# p2p_get.py - 下载端：默认主动发起 offer；但也能接收对方主动的 offer（避免“撞车”）
-# 采用“简化版 Perfect Negotiation”：若在我们创建本地 offer 前收到远端 offer，则先当被动端应答。
-
+# fetch.py
 import argparse
 import asyncio
+import hashlib
 import json
-import logging
+import os
 import websockets
-from aiortc import RTCIceServer, RTCConfiguration, RTCPeerConnection, RTCSessionDescription
-from aiortc.data_channel import RTCDataChannel
+from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer, RTCConfiguration
 
-logging.basicConfig(level=logging.INFO)
+CHUNK_LIMIT_FOR_FLUSH = 4 * 1024 * 1024  # 每 4MB flush 一次
 
-ICE_SERVERS = [
-    RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
-]
+async def run(args):
+    ice_servers = []
+    if args.stun:
+        ice_servers.append(RTCIceServer(urls=[args.stun]))
+    if args.turn and args.turn_user and args.turn_pass:
+        ice_servers.append(RTCIceServer(urls=[args.turn], username=args.turn_user, credential=args.turn_pass))
 
-class Downloader:
-    def __init__(self, out_path: str | None):
-        self.out_path = out_path
-        self.meta = None
-        self.file = None
-        self.next_index = 0
-        self.received = 0
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=ice_servers))
+    file = None
+    sha256 = hashlib.sha256()
+    expect_size = None
+    recv_size = 0
+    out_path = None
+    buffered = 0
+    channel_ready = asyncio.Event()
+    sender_channel = None
 
-    def open(self, name: str):
-        path = self.out_path or name
-        self.file = open(path, "wb")
-        return path
+    @pc.on("datachannel")
+    def on_datachannel(ch):
+        nonlocal sender_channel
+        sender_channel = ch
+        @ch.on("open")
+        def _open():
+            channel_ready.set()
 
-    def close(self):
-        if self.file:
-            self.file.close()
-
-    def write_chunk(self, b: bytes):
-        self.file.write(b)
-        self.received += len(b)
-
-    def progress(self):
-        if not self.meta:
-            return "?"
-        size = self.meta["size"]
-        pct = (self.received / size) * 100 if size else 0
-        return f"{self.received}/{size} bytes ({pct:.2f}%)"
-
-async def run(signal_url: str, file_id: str, out_path: str | None = None):
-    async with websockets.connect(signal_url, max_size=2**25) as ws:
-        await ws.send(json.dumps({"type": "register", "role": "client", "file_id": file_id}))
-        logging.info("[client] registered, waiting peer ...")
-
-        pc = RTCPeerConnection(configuration=RTCConfiguration(ICE_SERVERS))
-        dc: RTCDataChannel | None = None
-        dl = Downloader(out_path)
-
-        made_local_offer = asyncio.Event()
-        got_remote_offer = asyncio.Event()
-        ready = asyncio.Event()
-
-        def ensure_dc():
-            nonlocal dc
-            if not dc:
-                dc = pc.createDataChannel("file")
-                @dc.on("open")
-                def on_open():
-                    logging.info("[client] datachannel open, requesting META ...")
-                    dc.send(json.dumps({"type": "GET_META"}))
-                @dc.on("message")
-                def on_message(data):
-                    if isinstance(data, bytes):
-                        dl.write_chunk(data)
-                        if dl.next_index + 1 < dl.meta["chunks"]:
-                            dl.next_index += 1
-                            dc.send(json.dumps({"type": "GET_CHUNK", "index": dl.next_index}))
+        @ch.on("message")
+        def _msg(msg):
+            nonlocal file, expect_size, recv_size, out_path, buffered
+            if isinstance(msg, bytes):
+                if file is None:
+                    # 未收到 meta 就来了二进制，忽略
+                    return
+                file.write(msg)
+                sha256.update(msg)
+                recv_size += len(msg)
+                buffered += len(msg)
+                # 简易 flush 控制
+                if buffered >= CHUNK_LIMIT_FOR_FLUSH:
+                    file.flush()
+                    os.fsync(file.fileno())
+                    buffered = 0
+                if args.quiet is False and expect_size:
+                    pct = recv_size / expect_size * 100
+                    print(f"\rReceiving {os.path.basename(out_path)}: {recv_size}/{expect_size} ({pct:.1f}%)", end="")
+            else:
+                # 文本：meta/eof
+                try:
+                    j = json.loads(msg)
+                except Exception:
+                    return
+                if j.get("kind") == "meta":
+                    name = j["name"]
+                    expect_size = int(j["size"])
+                    out_name = args.output if args.output else name
+                    out_path = os.path.abspath(out_name)
+                    # 防覆盖
+                    if os.path.exists(out_path):
+                        if args.overwrite:
+                            pass
                         else:
-                            logging.info("[client] download done: %s", dl.progress())
-                            ready.set()
-                    else:
-                        try:
-                            obj = json.loads(data)
-                        except Exception:
-                            return
-                        if obj.get("type") == "META":
-                            dl.meta = obj
-                            dl.open(obj["name"])
-                            logging.info("[client] META: name=%s size=%d chunks=%d", obj["name"], obj["size"], obj["chunks"])
-                            dc.send(json.dumps({"type": "GET_CHUNK", "index": 0}))
+                            base, ext = os.path.splitext(out_path)
+                            k = 1
+                            while os.path.exists(out_path):
+                                out_path = f"{base}.recv{'' if k==1 else k}{ext}"
+                                k += 1
+                    file = open(out_path, "wb")
+                    print(f"Receiving to: {out_path}")
+                elif j.get("kind") == "eof":
+                    remote_digest = j["sha256"]
+                    if file:
+                        file.flush()
+                        os.fsync(file.fileno())
+                        file.close()
+                        file = None
+                    local_digest = sha256.hexdigest()
+                    print()
+                    print(f"Done. sha256 local={local_digest}")
+                    if remote_digest != local_digest:
+                        print(f"WARNING: sha256 mismatch! remote={remote_digest}")
+                    # 回 ACK
+                    ch.send(json.dumps({"kind":"ack"}))
+
+    @pc.on("iceconnectionstatechange")
+    def on_ice():
+        print("ICE state:", pc.iceConnectionState)
+
+    async with websockets.connect(args.signaling) as ws:
+        await ws.send(json.dumps({"type":"join","room":args.room,"role":"receiver"}))
+        joined = json.loads(await ws.recv())
+        assert joined.get("type")=="joined"
+
+        # 等待对端 offer，设置远端，再应答
+        async def recv_task():
+            async for raw in ws:
+                m = json.loads(raw)
+                if m["type"]=="sdp":
+                    sdp = m["data"]
+                    await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp["sdp"], type=sdp["type"]))
+                    answer = await pc.createAnswer()
+                    await pc.setLocalDescription(answer)
+                    await ws.send(json.dumps({"type":"sdp","data":{
+                        "sdp": pc.localDescription.sdp,
+                        "type": pc.localDescription.type
+                    }}))
+                elif m["type"]=="ice":
+                    cand = m["data"]
+                    await pc.addIceCandidate(cand)
+        rt = asyncio.create_task(recv_task())
 
         @pc.on("icecandidate")
-        async def on_icecandidate(event):
-            cand = event.candidate
-            if cand:
-                await ws.send(json.dumps({
-                    "type": "candidate",
-                    "file_id": file_id,
-                    "candidate": cand.to_sdp(),
-                }))
+        async def on_candidate(c):
+            if c:
+                await ws.send(json.dumps({"type":"ice","data":{
+                    "candidate": c.to_sdp(),
+                    "sdpMid": c.sdpMid,
+                    "sdpMLineIndex": c.sdpMLineIndex
+                }}))
 
-        async def make_offer():
-            # 只有在没收到远端 offer 的情况下才主动发
-            if not got_remote_offer.is_set():
-                ensure_dc()
-                offer = await pc.createOffer()
-                await pc.setLocalDescription(offer)
-                await ws.send(json.dumps({
-                    "type": "offer",
-                    "file_id": file_id,
-                    "sdp": {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp},
-                }))
-                made_local_offer.set()
-                logging.info("[client] local offer sent")
-
-        # 等待 peer-ready 再决定是否先手
-        peer_ready = asyncio.Event()
-
-        async for raw in ws:
-            msg = json.loads(raw)
-            t = msg.get("type")
-
-            if t == "peer-ready":
-                peer_ready.set()
-                # 小延迟，给对端先手机会，降低“撞车”概率
-                await asyncio.sleep(0.5)
-                # 若还没收到远端 offer，则我们主动发
-                asyncio.create_task(make_offer())
-
-            elif t == "offer":
-                got_remote_offer.set()
-                offer = RTCSessionDescription(sdp=msg["sdp"]["sdp"], type=msg["sdp"]["type"]) 
-                await pc.setRemoteDescription(offer)
-                # 我们现在作为被动端应答
-                answer = await pc.createAnswer()
-                await pc.setLocalDescription(answer)
-                await ws.send(json.dumps({
-                    "type": "answer",
-                    "file_id": file_id,
-                    "sdp": {"type": pc.localDescription.type, "sdp": pc.localDescription.sdp},
-                }))
-                logging.info("[client] answer sent")
-
-            elif t == "answer":
-                answer = RTCSessionDescription(sdp=msg["sdp"]["sdp"], type=msg["sdp"]["type"]) 
-                await pc.setRemoteDescription(answer)
-                logging.info("[client] remote answer set")
-
-            elif t == "candidate":
-                cand_sdp = msg.get("candidate")
-                if cand_sdp:
-                    await pc.addIceCandidate(cand_sdp)
-
-            # 如果我们已经创建了本地 offer，确保有数据通道
-            if made_local_offer.is_set() and not dc:
-                ensure_dc()
-
-            if ready.is_set():
-                break
-
-        dl.close()
-        logging.info("[client] saved, %s", dl.progress())
+        # 等待结束（通过 ack 后 sender 会主动断）
+        await channel_ready.wait()
+        await pc._connection_state_complete.wait()  # 保证状态就绪
+        await rt
+    await pc.close()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--signal", required=True, help="ws://host:port")
-    parser.add_argument("--file-id", required=True)
-    parser.add_argument("-o", "--output", default=None)
+    parser.add_argument("--signaling", required=True, help="ws://your-vps-ip:8765")
+    parser.add_argument("--room", required=True)
+    parser.add_argument("--stun", default="stun:stun.l.google.com:19302")
+    parser.add_argument("--turn")
+    parser.add_argument("--turn-user")
+    parser.add_argument("--turn-pass")
+    parser.add_argument("--output", help="save as path (optional)")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--quiet", action="store_true", default=False)
     args = parser.parse_args()
-    asyncio.run(run(args.signal, args.file_id, args.output))
+    asyncio.run(run(args))
